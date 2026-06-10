@@ -9,6 +9,7 @@ venv/
 # Data — never commit raw measurement files
 dataset/
 *.txt
+!requirements.txt
 verify_output/
 stacked-plot/
 Plot/
