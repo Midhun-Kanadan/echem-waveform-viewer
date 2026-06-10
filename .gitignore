@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+env/
+venv/
+
+# Data — never commit raw measurement files
+dataset/
+*.txt
+verify_output/
+stacked-plot/
+Plot/
+
+# Local docs — not for the repo
+LOCAL_SETUP_FOR_FRIEND.md
+
+# Debug / scratch scripts
+debug_*.py
+verify_curves.py
+
+# Streamlit local cache
+.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
