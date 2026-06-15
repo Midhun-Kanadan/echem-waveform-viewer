@@ -64,7 +64,8 @@ def load_txt(name: str, data: bytes) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def find_qualifying_window(name: str, data: bytes, min_cycles: int = 10,
-                            spike_pct: int = 98, spike_dist: int = 4000):
+                            spike_pct: int = 98, spike_dist: int = 4000,
+                            after_ms: float = 0.0):
     """Return window around first anodic spike with >= min_cycles T_on before it."""
     try:
         df = pd.read_csv(io.BytesIO(data), sep="\t", header=None, names=["time", "ch1", "ch2"])
@@ -136,32 +137,62 @@ def find_qualifying_window(name: str, data: bytes, min_cycles: int = 10,
                 _bl40 = float(np.percentile(df["ch1"], 40))
 
                 if _n == min_cycles - 1 and _zone_covers:
-                    # CASE B: one dip missing (removed at-spike dip, or undetected
-                    # first dip). Step back 1 T_cycle from the first detected dip
-                    # then scan forward to the T_on baseline.
-                    t_d0      = df["time"].values[int(dips_before[0])]
-                    cand      = int(np.searchsorted(df["time"].values, t_d0 - t_cycle_s))
-                    cand      = max(prev_peak + 1, cand)
-                    scan      = df["ch1"].values[cand : int(dips_before[0])]
-                    risen     = np.where(scan >= _bl40)[0]
-                    start_idx = (cand + int(risen[0])) if len(risen) > 0 else int(dips_before[0])
+                    _d0    = int(dips_before[0])
+                    _lo    = prev_peak + 1
+                    _t_gap = df["time"].values[_d0] - (df["time"].iloc[prev_peak] if ci > 0 else df["time"].iloc[0])
+
+                    if _t_gap < 1.5 * t_cycle_s:
+                        # dips_before[0] is the T_off dip right after prev_peak's spike
+                        # (last dip was removed because it was AT the spike).
+                        # The 10th T_on (T_on_0) is BEFORE dips_before[0] — scan backward
+                        # from dips_before[0] to find where T_on_0 starts.
+                        _rev      = df["ch1"].values[_lo : _d0][::-1]
+                        _in_plat  = np.where(_rev >= _bl40)[0]
+                        if len(_in_plat) > 0:
+                            _plat_exit = np.where(_rev[_in_plat[0]:] < _bl40)[0]
+                            start_idx  = (_d0 - int(_in_plat[0]) - int(_plat_exit[0])
+                                          if len(_plat_exit) > 0 else _lo)
+                        else:
+                            start_idx = _d0
+                    else:
+                        # First T_off dip was missed/undetected.
+                        # Step back 1 T_cycle from dips_before[0] and scan forward
+                        # to the T_on baseline.
+                        t_d0  = df["time"].values[_d0]
+                        cand  = int(np.searchsorted(df["time"].values, t_d0 - t_cycle_s))
+                        cand  = max(_lo, cand)
+                        scan  = df["ch1"].values[cand : _d0]
+                        risen = np.where(scan >= _bl40)[0]
+                        start_idx = (cand + int(risen[0])) if len(risen) > 0 else _d0
 
                 else:
                     start_idx = int(dips_before[0])
 
-                # End: spike peak exactly — no post-spike data shown.
-                end_idx = int(peak)
+                # End: spike peak → stop at first post-spike dip minimum (within after_ms window)
+                _post_lo = int(peak) + 1
+                _post_hi = min(len(df), int(peak) + max(1, int(round(after_ms * 10))) + 1)
+                if after_ms > 0 and _post_lo < _post_hi:
+                    _post_seg  = df["ch1"].values[_post_lo : _post_hi]
+                    _post_mins, _ = find_peaks(-_post_seg, distance=10)
+                    end_idx = (_post_lo + int(_post_mins[0])) if len(_post_mins) > 0 else (_post_hi - 1)
+                else:
+                    end_idx = int(peak)
 
                 spike_time = df["time"].iloc[peak]
                 df_win     = df.iloc[start_idx : end_idx + 1].copy()
                 t_ms       = (df_win["time"] - spike_time) * 1000   # 0 at spike
+                # τ of the last T_off dip before the spike (used for dip-alignment mode)
+                _last_dip_t_ms = float(
+                    (df["time"].values[int(dips_before[-1])] - spike_time) * 1000
+                )
                 return {
-                    "t_ms":      t_ms.values,
-                    "ch1":       df_win["ch1"].values,
-                    "ch2":       df_win["ch2"].values,
-                    "n_cycles":  _n + (1 if (_n == min_cycles - 1 and _zone_covers) else 0),
-                    "spike_t_ms": 0.0,   # spike is always at x = 0
-                    "file":      name,
+                    "t_ms":           t_ms.values,
+                    "ch1":            df_win["ch1"].values,
+                    "ch2":            df_win["ch2"].values,
+                    "n_cycles":       _n + (1 if (_n == min_cycles - 1 and _zone_covers) else 0),
+                    "spike_t_ms":     0.0,
+                    "last_dip_t_ms":  _last_dip_t_ms,
+                    "file":           name,
                 }
     except Exception:
         pass
@@ -546,13 +577,18 @@ with tab_viewer:
         buf.seek(0)
         return buf.read()
 
-    col_dl1, col_dl2 = st.columns([1, 5])
+    col_dl1, col_dl2, col_dl3 = st.columns([1, 1, 4])
     with col_dl1:
-        st.download_button("⬇️ Download PNG", make_mpl_png(),
+        st.download_button("⬇️ PNG", make_mpl_png(),
                            f"PPGa7865_{txt_path.stem}.png", "image/png",
                            width='stretch')
     with col_dl2:
-        st.caption("Exports a high-res matplotlib figure with current axis settings.")
+        _sv_html = fig.to_html(include_plotlyjs="cdn").encode("utf-8")
+        st.download_button("⬇️ HTML", _sv_html,
+                           f"PPGa7865_{txt_path.stem}.html", "text/html",
+                           width='stretch')
+    with col_dl3:
+        st.caption("PNG: static high-res matplotlib export · HTML: interactive Plotly chart")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -578,7 +614,7 @@ with tab_stacked:
     st.markdown("---")
 
     # ── Controls ──────────────────────────────────────────────────────────────
-    col_a, col_b = st.columns([3, 1])
+    col_a, col_b, col_b2 = st.columns([3, 1, 1])
     with col_a:
         tp_input = st.text_input(
             "⏱ Time points — minutes from first qualifying file (comma-separated)",
@@ -590,6 +626,10 @@ with tab_stacked:
     with col_b:
         min_cyc = st.number_input("Min T_on cycles", min_value=3, max_value=20, value=10,
                                    help="Minimum T_on cycles required before the spike")
+    with col_b2:
+        post_spike_ms = st.number_input("Post-spike tail (ms)", min_value=0.0, max_value=200.0,
+                                         value=30.0, step=5.0,
+                                         help="Milliseconds of post-spike descent to include on the right")
 
     col_c, col_d, col_e = st.columns(3)
     with col_c:
@@ -600,10 +640,29 @@ with tab_stacked:
     with col_e:
         stack_lw = st.slider("Line width", 0.3, 2.5, 0.9, step=0.1, key="st_lw")
 
+    align_mode = st.radio(
+        "Align on",
+        ["Spike (τ = 0 at spike)", "Last T_off dip (τ = 0 at last dip)"],
+        index=0, horizontal=True, key="st_align",
+        help="'Spike' centres all curves on the anodic spike. "
+             "'Last T_off dip' shifts each curve so its last T_off dip before the spike lands at τ = 0, "
+             "perfectly aligning the T_on/T_off features across curves (the spike then appears at a small positive τ).",
+    )
+
+    if stack_ch in ("Current (I)", "Both"):
+        _tp_labels = ["Earliest", "1 min", "10 min", "1 h", "5 h", "10 h", "Last"]
+        _default   = "5 h" if "5 h" in _tp_labels else _tp_labels[-1]
+        curr_rep_label = st.selectbox(
+            "Representative current curve",
+            _tp_labels,
+            index=_tp_labels.index(_default),
+            help="Current is nearly identical across time points — one representative curve is plotted.",
+        )
+
     with st.expander("📐 Y-axis limits for stacked plot"):
         lc1, lc2, lc3, lc4 = st.columns(4)
-        s_phi_min  = lc1.number_input("Φ min (V)",  value=-3.5,  step=0.1,   format="%.2f",  key="s_phi_min")
-        s_phi_max  = lc2.number_input("Φ max (V)",  value=0.5,   step=0.1,   format="%.2f",  key="s_phi_max")
+        s_phi_min  = lc1.number_input("Φ min (V)",  value=-4.5,  step=0.1,   format="%.2f",  key="s_phi_min")
+        s_phi_max  = lc2.number_input("Φ max (V)",  value=-0.2,  step=0.1,   format="%.2f",  key="s_phi_max")
         s_curr_min = lc3.number_input("I min (V)",  value=-0.003,step=0.001, format="%.4f",  key="s_curr_min")
         s_curr_max = lc4.number_input("I max (V)",  value=0.010, step=0.001, format="%.4f",  key="s_curr_max")
 
@@ -631,7 +690,7 @@ with tab_stacked:
             # ── "Earliest" ── scan from first file forward
             earliest_ts = None
             for fname in file_names:
-                res = find_qualifying_window(fname, _file_bytes[fname], min_cyc)
+                res = find_qualifying_window(fname, _file_bytes[fname], min_cyc, after_ms=post_spike_ms)
                 if res is not None:
                     fts = _parse_ts(fname)
                     earliest_ts = fts  # reference timestamp for subsequent time points
@@ -643,7 +702,7 @@ with tab_stacked:
 
             # ── "Last" ── scan from last file backward
             for fname in reversed(file_names):
-                res = find_qualifying_window(fname, _file_bytes[fname], min_cyc)
+                res = find_qualifying_window(fname, _file_bytes[fname], min_cyc, after_ms=post_spike_ms)
                 if res is not None:
                     fts = _parse_ts(fname)
                     elapsed_min = (fts - exp_start).total_seconds() / 60 if fts else total_h * 60
@@ -671,7 +730,7 @@ with tab_stacked:
                 scan_hi = min(best_idx + 11, len(file_names))
                 candidates = []
                 for fi in range(scan_lo, scan_hi):
-                    r = find_qualifying_window(file_names[fi], _file_bytes[file_names[fi]], min_cyc)
+                    r = find_qualifying_window(file_names[fi], _file_bytes[file_names[fi]], min_cyc, after_ms=post_spike_ms)
                     if r is not None:
                         fts_c = _parse_ts(file_names[fi])
                         dist  = abs((fts_c - target_ts).total_seconds()) if fts_c else float("inf")
@@ -751,24 +810,48 @@ with tab_stacked:
         # ── Build figure ──────────────────────────────────────────────────────
         fig_s = go.Figure()
 
+        # ── Alignment: compute per-entry τ offset ────────────────────────────
+        _use_dip_align = align_mode.startswith("Last T_off dip")
+        if _use_dip_align and all("last_dip_t_ms" in e for e in entries):
+            # Shift each curve by the difference between its last T_off dip τ and
+            # the median last-dip τ across all curves.  This keeps the shifts small
+            # (typically ±5 ms) and aligns all T_on/T_off features perfectly.
+            _ref = float(np.median([e["last_dip_t_ms"] for e in entries]))
+            _offsets = {e["label"]: _ref - e["last_dip_t_ms"] for e in entries}
+        else:
+            _offsets = {e["label"]: 0.0 for e in entries}
+
+        # Pick the representative current entry (closest label match, fallback to last).
+        _rep_entry = next((e for e in entries if e["label"] == curr_rep_label), entries[-1]) \
+                     if stack_ch in ("Current (I)", "Both") else None
+        _curr_color = "#c0392b" if stack_theme == "Light" else "#ff6b6b"
+
         for i, e in enumerate(entries):
-            t   = e["t_ms"]
+            _off = _offsets[e["label"]]
+            # Trim spike-recovery tail from left edge: drop samples above T_on level
+            _t_on_lvl = float(np.median(e["ch1"]))
+            _valid     = np.where(e["ch1"] <= _t_on_lvl)[0]
+            _s         = int(_valid[0]) if len(_valid) > 0 else 0
+            t          = e["t_ms"][_s:] + _off
             lbl = e["label"]
             if stack_ch in ("Potential (Φ)", "Both"):
                 fig_s.add_trace(go.Scatter(
-                    x=t, y=e["ch1"], name=f"Φ — {lbl}",
+                    x=t, y=e["ch1"][_s:], name=f"Φ — {lbl}",
                     line=dict(color=phi_cols[i], width=stack_lw),
                     yaxis="y", legendgroup=lbl,
                     hovertemplate=f"<b>{lbl}</b><br>τ=%{{x:.1f}} ms<br>Φ=%{{y:.4f}} V<extra></extra>",
                 ))
-            if stack_ch in ("Current (I)", "Both"):
-                fig_s.add_trace(go.Scatter(
-                    x=t, y=e["ch2"], name=f"I — {lbl}",
-                    line=dict(color=curr_cols[i], width=stack_lw),
-                    yaxis="y2" if use_dual else "y",
-                    legendgroup=lbl,
-                    hovertemplate=f"<b>{lbl}</b><br>τ=%{{x:.1f}} ms<br>I=%{{y:.5f}} V<extra></extra>",
-                ))
+
+        # Current: single representative trace only (no left-edge trimming — ch2 has no spike artifact)
+        if stack_ch in ("Current (I)", "Both") and _rep_entry is not None:
+            _roff = _offsets[_rep_entry["label"]]
+            fig_s.add_trace(go.Scatter(
+                x=_rep_entry["t_ms"] + _roff, y=_rep_entry["ch2"],
+                name=f"I — {_rep_entry['label']} (representative)",
+                line=dict(color=_curr_color, width=stack_lw),
+                yaxis="y2" if use_dual else "y",
+                hovertemplate=f"<b>I ({_rep_entry['label']})</b><br>τ=%{{x:.1f}} ms<br>I=%{{y:.5f}} V<extra></extra>",
+            ))
 
         yax1_range = ([s_phi_min, s_phi_max] if stack_ch != "Current (I)"
                       else [s_curr_min, s_curr_max])
@@ -783,7 +866,8 @@ with tab_stacked:
             title=dict(text="<b>PPGa7865</b> — Stacked Evolution",
                        font=dict(size=13, color=ax_s), x=0, xanchor="left"),
             xaxis=dict(
-                title=dict(text="τ in ms", font=dict(size=14, color=ax_s)),
+                title=dict(text="τ in ms  (0 = last T_off dip)" if _use_dip_align else "τ in ms  (0 = spike)",
+                           font=dict(size=14, color=ax_s)),
                 side="top", tickangle=90, tickfont=dict(size=9, color=ax_s),
                 showgrid=True, gridwidth=0.5, gridcolor=gc_s,
                 showline=True, linecolor=lc_s, mirror=True,
