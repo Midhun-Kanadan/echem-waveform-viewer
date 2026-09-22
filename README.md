@@ -10,8 +10,19 @@ Interactive Streamlit app for visualising **Yokogawa DL850E** transient recorder
 
 | Tab | What it shows |
 |-----|--------------|
-| **Signal Viewer** | Full waveform browser with spike markers. Window modes: full file, between spikes, centred on spike, manual range. |
-| **Stacked Evolution** | Overlays 10 T_on cycles before the first qualifying anodic spike for 7 time points (Earliest · 1 min · 10 min · 1 h · 5 h · 10 h · Last). Download as PNG or interactive HTML. |
+| **Signal Viewer** | Full waveform browser with spike markers. Window modes: full file, between spikes, centred on spike, manual range. Download as CSV, PNG, HTML or **Excel with a native (editable) chart**. |
+| **Stacked Evolution** | Overlays 10 T_on cycles before the first qualifying anodic spike for 7 time points (Earliest · 1 min · 10 min · 1 h · 5 h · 10 h · Last). Optional averaging of N consecutive files per time point. Excel export puts all curves on one common τ grid. |
+| **Transient Evolution** | For every Nth capture, averages all pulse cycles and plots resting potential, pulse-end potential, pulse depth, anodic-spike height and recovery time against deposition time, with a summary of when each quantity settles. Download as CSV, HTML or Excel with charts. |
+
+**Sidebar options that apply to all tabs**
+
+- **Sample name**: used in titles and file names.
+- **Denoise**: off, zero-phase low-pass, or Savitzky-Golay.
+  - Spike detection always uses the raw signal.
+  - The raw signal can be shown underneath the filtered one.
+  - Raw columns are kept in the exports.
+- **Include subfolders**: load a full run spread over several folders.
+- **Auto-scaled axes**: detection thresholds scale with the signal, so small-amplitude samples work too.
 
 ## How to use
 
@@ -25,7 +36,7 @@ f20260323_155227_527_filter.txt
 ...
 ```
 
-Each file is **tab-separated**, has **10 header rows** to skip, and contains three columns:
+Each file is **tab-separated**, has **no header**, and contains three columns. The first 10 rows are digital-filter warm-up and are skipped automatically:
 
 ```
 time(s)   ch1(V)   ch2(V)
@@ -47,13 +58,13 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-When running locally you can also upload a ZIP via the sidebar, exactly as in the cloud version.
+When running locally you can also choose **Local folder** in the sidebar and paste the path to your dataset folder. Files are then read on demand, which also works for full runs of several GB.
 
 ## Data format
 
 | Column | Channel | Typical range |
 |--------|---------|---------------|
-| `ch1` | Potential Φ (V) | −3.5 V … 0.5 V |
+| `ch1` | Potential Φ (V), measured between cathode and anode | sample-dependent, e.g. −3 … −0.5 V or −0.23 … −0.07 V |
 | `ch2` | Current via shunt (V) | −0.003 V … 0.010 V |
 
 - Sampling rate: **10 kHz** (0.1 ms / sample)
@@ -65,7 +76,8 @@ When running locally you can also upload a ZIP via the sidebar, exactly as in th
 ```
 streamlit >= 1.35
 pandas, numpy, scipy, plotly, matplotlib
-kaleido  # optional — needed for PNG export in the Stacked Evolution tab
+openpyxl # Excel export
+kaleido  # optional — PNG export in the Stacked Evolution tab (kaleido ≥ 1.0 also needs Chrome)
 ```
 
 ## License
