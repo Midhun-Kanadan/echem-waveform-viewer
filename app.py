@@ -23,6 +23,17 @@ from scipy.signal import find_peaks
 
 from plotly.subplots import make_subplots
 
+# Streamlit (incl. Community Cloud after a git push) re-runs app.py without restarting Python,
+# so an already-imported echem_utils would stay at its old version and new names would fail to
+# import. Reload it whenever the file on disk has changed.
+import importlib
+import os
+import echem_utils
+_eu_mtime = os.path.getmtime(echem_utils.__file__)
+if getattr(echem_utils, "_loaded_mtime", None) != _eu_mtime:
+    echem_utils = importlib.reload(echem_utils)
+    echem_utils._loaded_mtime = _eu_mtime
+
 from echem_utils import (DENOISE_METHODS, FEATURE_INFO, average_windows, cycle_features,
                          cycle_minima, denoise, denoise_label, evolution_excel, is_flat,
                          min_spike_amp, minima_meansd_excel, signal_excel, stacked_excel)
