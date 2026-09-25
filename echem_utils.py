@@ -311,7 +311,9 @@ def minima_meansd_excel(stats: dict, title: str, value_label: str, note: str = "
       Chart          chart 1: cycles 2–10, mean ± SD error bars, straight lines, cycle on x
                      chart 2: cycles 1–10 (shows the post-anodic cycle 1), no error bars
       Mean and SD    Cycle | <label> mean | <label> SD | …
-      Sreya layout   Cycle | <label> … (mean only, same layout as her 'P minimum VS Cycle' sheet)
+      Sheet1         her paired layout (<label>: Potential | Cycle) + 2 charts in her orientation
+                     (potential on x, cycle on y), straight lines, ± SD as x error bars
+      Sheet1 (2)     Cycle | <label> … (her second layout)
     """
     from openpyxl import Workbook
     from openpyxl.chart import Reference, Series
@@ -341,11 +343,59 @@ def minima_meansd_excel(stats: dict, title: str, value_label: str, note: str = "
         ds.column_dimensions[ds.cell(row=1, column=k).column_letter].width = 15
     ds.freeze_panes = "B2"
 
-    ss = wb.create_sheet("Sreya layout")
+    # Sreya's two layouts, same sheet names as in her 'P minimum VS Cycle' workbooks
+    ss = wb.create_sheet("Sheet1 (2)")            # Cycle | <label> …
     ss.append([None] + labels)
     ss.append(["Cycle"] + ["Potential"] * len(labels))
     for c in range(n_c):
         ss.append([c + 1] + [float(stats[l][0][c]) for l in labels])
+
+    s1 = wb.create_sheet("Sheet1")                # <label>: Potential | Cycle, pair per time point
+    s1.append([x for l in labels for x in (l, None)])
+    s1.append([x for _ in labels for x in ("Potential", "Cycle")])
+    for c in range(n_c):
+        s1.append([x for l in labels for x in (float(stats[l][0][c]), c + 1)])
+    for k in range(1, 2 * len(labels) + 1):
+        s1.column_dimensions[s1.cell(row=1, column=k).column_letter].width = 11
+    office = ["5B9BD5", "ED7D31", "A5A5A5", "FFC000", "4472C4", "70AD47", "264478",
+              "9E480E", "636363", "997300"]           # Excel's default series colours, as in her chart
+
+    def make_sheet1_chart(first_cycle, with_err, ctitle):
+        """Her orientation: potential on x, cycle on y — but straight lines and ± SD as x error bars."""
+        r0, r1 = 2 + first_cycle, 2 + n_c                        # data rows in 'Sheet1'
+        ch = _scatter(ctitle, "Potential in V")
+        ch.scatterStyle = "lineMarker"; ch.varyColors = False
+        ch.height, ch.width = 11, 20
+        vals = []
+        for j, l in enumerate(labels):
+            col = office[j % len(office)]
+            pcol = 1 + 2 * j
+            s = Series(Reference(s1, min_col=pcol + 1, min_row=r0, max_row=r1),
+                       Reference(s1, min_col=pcol, min_row=r0, max_row=r1), title=l)
+            s.smooth = False
+            s.marker.symbol = "circle"; s.marker.size = 6
+            s.marker.graphicalProperties.solidFill = col
+            s.marker.graphicalProperties.line.solidFill = col
+            s.graphicalProperties.line.solidFill = col
+            s.graphicalProperties.line.width = 19050
+            m, sd, _ = stats[l]
+            if with_err and not np.all(np.isnan(sd)):
+                sdl = ds.cell(row=1, column=3 + 2 * j).column_letter      # SD column in 'Mean and SD'
+                src = NumDataSource(numRef=NumRef(f=f"'Mean and SD'!${sdl}${first_cycle + 1}:${sdl}${n_c + 1}"))
+                s.errBars = ErrorBars(errDir="x", errBarType="both", errValType="cust",
+                                      noEndCap=False, plus=src, minus=src)
+            ch.series.append(s)
+            e = np.nan_to_num(sd[first_cycle - 1:]) if with_err else 0
+            vals += list(m[first_cycle - 1:] - e) + list(m[first_cycle - 1:] + e)
+        lo_, hi_ = min(vals), max(vals); sp = (hi_ - lo_) or 0.01
+        step = 10 ** np.floor(np.log10(sp / 5))
+        step *= next(mm for mm in (1, 2, 2.5, 5, 10) if sp / (step * mm) <= 6)
+        _axis(ch.x_axis, "Potential in V", float(np.floor(lo_ / step) * step), float(np.ceil(hi_ / step) * step), step)
+        ch.x_axis.number_format = "0.000"
+        _axis(ch.y_axis, "Cycle", float(first_cycle - 1), float(n_c + 1), 1)
+        ch.y_axis.crosses = "min"
+        ch.x_axis.crosses = "min"
+        return ch
 
     shades = np.linspace(0.95, 0.35, len(labels))
     colors = [to_hex(cm.Blues(s)).lstrip("#").upper() for s in shades]
@@ -391,6 +441,15 @@ def minima_meansd_excel(stats: dict, title: str, value_label: str, note: str = "
         cs["A2"] = note
     cs.add_chart(make_chart(2, True, f"{title} — cycles 2–10, {spread_label}"), "A4")
     cs.add_chart(make_chart(1, False, f"{title} — all cycles (cycle 1 follows the anodic pulse)"), "A27")
+
+    anchor = s1.cell(row=1, column=2 * len(labels) + 2).column_letter
+    s1.add_chart(make_sheet1_chart(1, True, "Potential V/S Cycle — all cycles"), f"{anchor}1")
+    s1.add_chart(make_sheet1_chart(2, True, "Potential V/S Cycle — cycles 2–10 (zoomed)"), f"{anchor}24")
+    s1.cell(row=n_c + 4, column=1,
+            value=("Same layout as the original 'Sheet1'. Charts: potential on x, cycle on y, straight lines "
+                   f"(no smoothing), horizontal error bars = ± SD between pulse sequences ({spread_label})."))
+    wb.move_sheet("Sheet1", offset=-(len(wb.sheetnames) - 2))     # order: Chart, Sheet1, Sheet1 (2), Mean and SD
+    wb.move_sheet("Sheet1 (2)", offset=-(wb.sheetnames.index("Sheet1 (2)") - 2))
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()

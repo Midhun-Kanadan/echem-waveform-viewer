@@ -905,6 +905,8 @@ with tab_min:
         mc_seq = st.selectbox("Pulse sequence", ["Mean of all complete sequences",
                                                  "Sequence 1", "Sequence 2", "Sequence 3"], key="mc_seq",
                               help="Sequence 1 = the one before spike #2 (same as the stacked plot for 7917).")
+    mc_orient = st.radio("Chart orientation", ["Cycle on x", "Potential on x (as in 'Sheet1')"],
+                         index=0, horizontal=True, key="mc_orient")
     mc4, mc5, mc6 = st.columns([1, 1, 2])
     with mc4:
         mc_c1 = st.checkbox("Include cycle 1", value=False, key="mc_c1")
@@ -985,25 +987,30 @@ with tab_min:
         cyc = np.arange(1, 11)
         shades = np.linspace(0.95, 0.35, len(stats))
         cols = [to_hex(cm.Blues(v)) for v in shades]
+        pot_x = mc_orient.startswith("Potential")
         figM = go.Figure()
         for (lbl, (m, sd, n)), col in zip(stats.items(), cols):
+            err = (dict(type="data", array=sd[c0:], visible=True, thickness=1.2, width=4, color=col)
+                   if (use_mean and mc_err) else None)
             figM.add_trace(go.Scatter(
-                x=cyc[c0:], y=m[c0:], mode="lines+markers", name=lbl,
+                x=m[c0:] if pot_x else cyc[c0:], y=cyc[c0:] if pot_x else m[c0:],
+                mode="lines+markers", name=lbl,
                 line=dict(color=col, width=2), marker=dict(size=8, color=col, line=dict(color="white", width=1)),
-                error_y=(dict(type="data", array=sd[c0:], visible=True, thickness=1.2, width=4, color=col)
-                         if (use_mean and mc_err) else None),
-                hovertemplate=f"<b>{lbl}</b><br>cycle %{{x}}<br>%{{y:.4f}} V<extra></extra>"))
+                error_x=err if pot_x else None, error_y=None if pot_x else err,
+                hovertemplate=(f"<b>{lbl}</b><br>cycle %{{y}}<br>%{{x:.4f}} V<extra></extra>" if pot_x else
+                               f"<b>{lbl}</b><br>cycle %{{x}}<br>%{{y:.4f}} V<extra></extra>")))
         _vl = {"min_V": "Minimum Φ in V", "min_raw_V": "Minimum Φ (raw) in V", "end_V": "Φ at end of pulse in V"}[_key]
+        _ax_cyc = dict(title="Cycle (1 = first of the ten, 10 = last before the anodic spike)",
+                       tickmode="linear", dtick=1, range=[c0 + 0.5, 10.5], showline=True, linecolor="black",
+                       gridcolor="rgba(150,150,150,0.3)")
+        _ax_pot = dict(title=_vl, tickformat=".3f", showline=True, linecolor="black",
+                       gridcolor="rgba(150,150,150,0.3)")
         figM.update_layout(
             height=520, margin=dict(l=70, r=30, t=70, b=50), plot_bgcolor="white", hovermode="closest",
             title=dict(text=f"<b>{sample}</b> — {mc_value.lower()} per cycle · "
                             f"{'mean ± SD of all complete sequences' if use_mean else mc_seq.lower()}",
                        x=0, xanchor="left", font=dict(size=13)),
-            xaxis=dict(title="Cycle (1 = first of the ten, 10 = last before the anodic spike)",
-                       tickmode="linear", dtick=1, range=[c0 + 0.5, 10.5], showline=True, linecolor="black",
-                       gridcolor="rgba(150,150,150,0.3)"),
-            yaxis=dict(title=_vl, tickformat=".3f", showline=True, linecolor="black",
-                       gridcolor="rgba(150,150,150,0.3)"),
+            xaxis=_ax_pot if pot_x else _ax_cyc, yaxis=_ax_cyc if pot_x else _ax_pot,
             legend=dict(title="time point"))
         st.plotly_chart(figM, width='stretch')
         _span = np.ptp(np.concatenate([s[0][c0:] for s in stats.values()])) * 1000
@@ -1031,8 +1038,9 @@ with tab_min:
                                 files=files_used,
                                 spread_label="mean ± SD" if use_mean else mc_seq.lower()),
             f"{_mbase}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="mc_xlsx")
-        st.caption("Excel: chart 1 = cycles 2–10 (with ± SD error bars when averaging), chart 2 = all cycles; "
-                   "a 'Sreya layout' sheet has the values in the old 'P minimum VS Cycle' format.")
+        st.caption("Excel: 'Chart' = cycle on x (cycles 2–10 with ± SD, and all cycles); 'Sheet1' = the original "
+                   "paired Potential | Cycle layout with two charts in its orientation (potential on x, straight "
+                   "lines, ± SD error bars); 'Sheet1 (2)' = Cycle | one column per time point; 'Mean and SD' = values.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
