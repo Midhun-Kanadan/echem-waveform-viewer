@@ -178,6 +178,231 @@ def cycle_features(ch1, ch2, fs: int = FS):
     }
 
 
+def cycle_minima(ch1, ch2, n_cycles: int = 10, cutoff_hz: float = 500.0, fs: int = FS):
+    """Minimum potential of each cathodic pulse in the `n_cycles` pulses before an anodic pulse.
+
+    Successor of extract_dip_minima.py (which searched the noisy potential for dips and, for
+    small-amplitude samples like 7917, picked noise points and found 9–11 "dips").
+    Here the pulses are located from the imposed *current*, so exactly n_cycles real pulses
+    are used; cycle 1 = first of the ten, cycle n = the one right before the anodic spike.
+
+    For every complete sequence in the capture (usually 3 of the 4 anodic pulses have 10 full
+    cycles before them) it measures per cycle:
+      min_V      minimum of the zero-phase low-passed potential inside the pulse (robust to noise)
+      min_raw_V  minimum of the raw potential (biased low by noise: ≈ −2.5 σ)
+      end_V      mean of the last 0.5 ms of the pulse (same as 'pulse_end_V' in cycle_features)
+      tau_ms     time of the filtered minimum relative to the anodic pulse start
+    Returns (list_of_sequences, all_sequences_mean_rows) — each sequence is a list of per-cycle
+    dicts, in time order — or (None, None).
+
+    Note: cycle 1 starts directly after the *previous* anodic pulse (no pause in between), so
+    its minimum is systematically less negative than cycles 2–10. That is physical, not an error.
+    """
+    from scipy.signal import medfilt
+    x = np.asarray(ch1, dtype=float); i = np.asarray(ch2, dtype=float)
+    if len(x) < fs // 2 or is_flat(x):
+        return None, None
+    xl = denoise(x, "Low-pass", cutoff_hz)
+    ism = medfilt(i, 11)
+    on = ism < 0.5 * np.percentile(ism, 10)
+    anod = ism > 0.5 * np.percentile(ism, 99.5)
+    starts = np.where(np.diff(on.astype(int)) == 1)[0] + 1
+    ends = np.where(np.diff(on.astype(int)) == -1)[0] + 1
+    if len(starts) and len(ends) and ends[0] < starts[0]:
+        ends = ends[1:]
+    pairs = [(s, e) for s, e in zip(starts, ends) if e > s]
+    a_idx = np.where(anod)[0]
+    a_starts = [r[0] for r in np.split(a_idx, np.where(np.diff(a_idx) > 1)[0] + 1) if len(r) >= 5] if len(a_idx) else []
+    pe = int(0.0005 * fs)
+    seqs = []
+    for a0 in a_starts:
+        before = [(s, e) for s, e in pairs if e <= a0]
+        # a sequence counts only if the n_cycles pulses are consecutive (no earlier anodic pulse in between)
+        if len(before) < n_cycles:
+            continue
+        sel = before[-n_cycles:]
+        if any((b > sel[0][0]) & (b < a0) for b in a_starts if b != a0):
+            continue
+        rows = []
+        for c, (s, e) in enumerate(sel, start=1):
+            k = s + int(np.argmin(xl[s:e]))
+            rows.append({"cycle": c, "min_V": float(xl[k]), "min_raw_V": float(x[s:e].min()),
+                         "end_V": float(x[e - pe:e].mean()), "tau_ms": (k - a0) / fs * 1000})
+        seqs.append(rows)
+    if not seqs:
+        return None, None
+    mean_rows = [{"cycle": c + 1, **{k: float(np.mean([s[c][k] for s in seqs])) for k in
+                  ("min_V", "min_raw_V", "end_V", "tau_ms")}, "n_sequences": len(seqs)}
+                 for c in range(n_cycles)]
+    return seqs, mean_rows
+
+
+def minima_excel(table, details, title: str, value_label: str, note: str = "") -> bytes:
+    """Workbook in the layout of Sreya's 'P minimum VS Cycle' sheet: column 'Cycle', then one
+    column per time point; native line chart (one series per time point) + a Details sheet."""
+    from openpyxl import Workbook
+    from openpyxl.chart import Reference, Series
+    from matplotlib import cm
+    from matplotlib.colors import to_hex
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Minimum vs cycle"
+    labels = [c for c in table.columns if c != "Cycle"]
+    ws.append(["Cycle"] + labels)
+    for _, r in table.iterrows():
+        ws.append([int(r["Cycle"])] + [None if np.isnan(r[l]) else float(r[l]) for l in labels])
+    for k in range(1, len(labels) + 2):
+        ws.column_dimensions[ws.cell(row=1, column=k).column_letter].width = 13
+    n = len(table) + 1
+
+    ch = _scatter(title, "Cycle (1 = first of the ten, 10 = last before the anodic spike)", 0.0,
+                  float(table["Cycle"].max()) + 1)
+    ch.scatterStyle = "lineMarker"; ch.varyColors = False
+    ch.height, ch.width = 12, 24
+    ch.x_axis.majorUnit = 1
+    x = Reference(ws, min_col=1, min_row=2, max_row=n)
+    shades = np.linspace(0.95, 0.35, len(labels))
+    for j, (lbl, sh) in enumerate(zip(labels, shades), start=2):
+        s = Series(Reference(ws, min_col=j, min_row=1, max_row=n), x, title_from_data=True)
+        col = to_hex(cm.Blues(sh)).lstrip("#").upper()
+        s.marker.symbol = "circle"; s.marker.size = 6
+        s.smooth = False
+        s.marker.graphicalProperties.solidFill = col
+        s.marker.graphicalProperties.line.solidFill = col
+        s.graphicalProperties.line.solidFill = col
+        s.graphicalProperties.line.width = 19050
+        ch.series.append(s)
+    vals = table[labels].to_numpy(dtype=float)
+    lo_, hi_ = np.nanmin(vals), np.nanmax(vals); sp = (hi_ - lo_) or 0.01
+    step = 10 ** np.floor(np.log10(sp / 5))
+    step *= next(m for m in (1, 2, 2.5, 5, 10) if sp / (step * m) <= 6)
+    _axis(ch.y_axis, value_label.split(",")[0].replace(" per cycle", ""), float(np.floor(lo_ / step) * step), float(np.ceil(hi_ / step) * step), step)
+    ch.y_axis.crosses = "min"
+    ws.add_chart(ch, f"{chr(ord('A') + len(labels) + 2)}2")
+    if note:
+        ws.cell(row=n + 2, column=1, value=note)
+
+    ds = wb.create_sheet("Details")
+    ds.append(list(details.columns))
+    for _, r in details.iterrows():
+        ds.append([v if isinstance(v, str) else (None if pd_isna(v) else float(v)) for v in r.values])
+    for k, c in enumerate(details.columns, start=1):
+        ds.column_dimensions[ds.cell(row=1, column=k).column_letter].width = max(12, len(c) + 2)
+    ds.freeze_panes = "A2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def minima_stats(seqs, key: str = "min_V"):
+    """Per-cycle mean and SD (ddof=1) over all complete sequences of one file."""
+    arr = np.array([[r[key] for r in s] for s in seqs], dtype=float)
+    sd = arr.std(axis=0, ddof=1) if len(arr) > 1 else np.full(arr.shape[1], np.nan)
+    return arr.mean(axis=0), sd, arr
+
+
+def minima_meansd_excel(stats: dict, title: str, value_label: str, note: str = "",
+                        files: dict = None, spread_label: str = "mean ± SD") -> bytes:
+    """Recommended 'minimum vs cycle' workbook.
+
+    stats: {label: (mean[10], sd[10], n_sequences)} in V.
+    Sheets:
+      Chart          chart 1: cycles 2–10, mean ± SD error bars, straight lines, cycle on x
+                     chart 2: cycles 1–10 (shows the post-anodic cycle 1), no error bars
+      Mean and SD    Cycle | <label> mean | <label> SD | …
+      Sreya layout   Cycle | <label> … (mean only, same layout as her 'P minimum VS Cycle' sheet)
+    """
+    from openpyxl import Workbook
+    from openpyxl.chart import Reference, Series
+    from openpyxl.chart.data_source import NumDataSource, NumRef
+    from openpyxl.chart.error_bar import ErrorBars
+    from matplotlib import cm
+    from matplotlib.colors import to_hex
+
+    labels = list(stats)
+    n_c = len(next(iter(stats.values()))[0])
+    wb = Workbook()
+    cs = wb.active
+    cs.title = "Chart"
+    ds = wb.create_sheet("Mean and SD")
+    ds.append(["Cycle"] + [h for l in labels for h in (f"{l} mean (V)", f"{l} SD (V)")])
+    for c in range(n_c):
+        row = [c + 1]
+        for l in labels:
+            m, s, _ = stats[l]
+            row += [float(m[c]), None if np.isnan(s[c]) else float(s[c])]
+        ds.append(row)
+    ds.append([])
+    ds.append(["Sequences averaged"] + [x for l in labels for x in (stats[l][2], None)])
+    if files:
+        ds.append(["File"] + [x for l in labels for x in (files.get(l, ""), None)])
+    for k in range(1, 2 * len(labels) + 2):
+        ds.column_dimensions[ds.cell(row=1, column=k).column_letter].width = 15
+    ds.freeze_panes = "B2"
+
+    ss = wb.create_sheet("Sreya layout")
+    ss.append([None] + labels)
+    ss.append(["Cycle"] + ["Potential"] * len(labels))
+    for c in range(n_c):
+        ss.append([c + 1] + [float(stats[l][0][c]) for l in labels])
+
+    shades = np.linspace(0.95, 0.35, len(labels))
+    colors = [to_hex(cm.Blues(s)).lstrip("#").upper() for s in shades]
+
+    def make_chart(first_cycle, with_err, ctitle):
+        r0, r1 = 1 + first_cycle, 1 + n_c                       # data rows in 'Mean and SD'
+        ch = _scatter(ctitle, "Cycle", float(first_cycle - 1), float(n_c + 1))   # whole-number ticks
+        ch.scatterStyle = "lineMarker"; ch.varyColors = False
+        ch.height, ch.width = 11, 22
+        ch.x_axis.majorUnit = 1
+        x = Reference(ds, min_col=1, min_row=r0, max_row=r1)
+        vals = []
+        for j, (l, col) in enumerate(zip(labels, colors)):
+            mcol = 2 + 2 * j
+            s = Series(Reference(ds, min_col=mcol, min_row=r0, max_row=r1), x, title=l)
+            s.smooth = False
+            s.marker.symbol = "circle"; s.marker.size = 6
+            s.marker.graphicalProperties.solidFill = col
+            s.marker.graphicalProperties.line.solidFill = col
+            s.graphicalProperties.line.solidFill = col
+            s.graphicalProperties.line.width = 19050
+            if with_err:
+                ref = f"'Mean and SD'!${ds.cell(row=1, column=mcol + 1).column_letter}${r0}:" \
+                      f"${ds.cell(row=1, column=mcol + 1).column_letter}${r1}"
+                src = NumDataSource(numRef=NumRef(f=ref))
+                s.errBars = ErrorBars(errDir="y", errBarType="both", errValType="cust",
+                                      noEndCap=False, plus=src, minus=src)
+            ch.series.append(s)
+            m, sd, _ = stats[l]
+            lo_c = first_cycle - 1
+            vals += list(m[lo_c:] - (np.nan_to_num(sd[lo_c:]) if with_err else 0))
+            vals += list(m[lo_c:] + (np.nan_to_num(sd[lo_c:]) if with_err else 0))
+        lo_, hi_ = min(vals), max(vals); sp = (hi_ - lo_) or 0.01
+        step = 10 ** np.floor(np.log10(sp / 5))
+        step *= next(mm for mm in (1, 2, 2.5, 5, 10) if sp / (step * mm) <= 6)
+        _axis(ch.y_axis, value_label, float(np.floor(lo_ / step) * step), float(np.ceil(hi_ / step) * step), step)
+        ch.y_axis.number_format = "0.000"
+        ch.y_axis.crosses = "min"
+        return ch
+
+    cs["A1"] = title
+    if note:
+        cs["A2"] = note
+    cs.add_chart(make_chart(2, True, f"{title} — cycles 2–10, {spread_label}"), "A4")
+    cs.add_chart(make_chart(1, False, f"{title} — all cycles (cycle 1 follows the anodic pulse)"), "A27")
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def pd_isna(v):
+    try:
+        return bool(np.isnan(v))
+    except TypeError:
+        return v is None
+
+
 # ── Excel export with native charts ───────────────────────────────────────────
 def _style_series(s, color_hex: str, width_pt: float = 0.75):
     s.marker.symbol = "none"

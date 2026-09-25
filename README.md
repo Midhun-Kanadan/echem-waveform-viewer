@@ -12,6 +12,7 @@ Interactive Streamlit app for visualising **Yokogawa DL850E** transient recorder
 |-----|--------------|
 | **Signal Viewer** | Full waveform browser with spike markers. Window modes: full file, between spikes, centred on spike, manual range. Download as CSV, PNG, HTML or **Excel with a native (editable) chart**. |
 | **Stacked Evolution** | Overlays 10 T_on cycles before the first qualifying anodic spike for 7 time points (Earliest · 1 min · 10 min · 1 h · 5 h · 10 h · Last). Optional averaging of N consecutive files per time point. Excel export puts all curves on one common τ grid. |
+| **Minimum vs Cycle** | Lowest potential of each of the 10 deposition pulses before the anodic spike, per time point. Pulses are found from the imposed current; values can be averaged over all complete pulse sequences in a file (mean ± SD error bars). Download as CSV, HTML or Excel (charts with error bars). |
 | **Transient Evolution** | For every Nth capture, averages all pulse cycles and plots resting potential, pulse-end potential, pulse depth, anodic-spike height and recovery time against deposition time, with a summary of when each quantity settles. Download as CSV, HTML or Excel with charts. |
 
 **Sidebar options that apply to all tabs**

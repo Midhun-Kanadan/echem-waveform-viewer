@@ -24,8 +24,8 @@ from scipy.signal import find_peaks
 from plotly.subplots import make_subplots
 
 from echem_utils import (DENOISE_METHODS, FEATURE_INFO, average_windows, cycle_features,
-                         denoise, denoise_label, evolution_excel, is_flat, min_spike_amp,
-                         signal_excel, stacked_excel)
+                         cycle_minima, denoise, denoise_label, evolution_excel, is_flat,
+                         min_spike_amp, minima_meansd_excel, signal_excel, stacked_excel)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -81,6 +81,18 @@ def file_features(name: str, src):
     try:
         df = _read_df(src)
         return cycle_features(df["ch1"].values, df["ch2"].values)
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def file_minima(name: str, src, cutoff: float = 500.0):
+    """Per-cycle minima of all complete 10-pulse sequences in one capture
+    (see echem_utils.cycle_minima). Returns the list of sequences or None."""
+    try:
+        df = _read_df(src)
+        seqs, _ = cycle_minima(df["ch1"].values, df["ch2"].values, cutoff_hz=cutoff)
+        return seqs
     except Exception:
         return None
 
@@ -407,8 +419,8 @@ with st.sidebar:
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_viewer, tab_stacked, tab_evol = st.tabs(
-    ["📈 Signal Viewer", "🔬 Stacked Evolution", "📉 Transient Evolution"])
+tab_viewer, tab_stacked, tab_evol, tab_min = st.tabs(
+    ["📈 Signal Viewer", "🔬 Stacked Evolution", "📉 Transient Evolution", "📊 Minimum vs Cycle"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -854,6 +866,162 @@ with tab_evol:
                             note=f"{len(evdf)} captures (every {int(ev_stride)}. file). "
                                  "Each point = average of all regular pulse cycles in one capture. Raw signal."),
             f"{_base}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — Minimum vs Cycle  (also placed before tab 2 because of its st.stop())
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_min:
+    st.subheader("📊 Minimum vs Cycle — lowest potential of each deposition pulse")
+    st.caption(
+        "For each time point, the 10 cathodic (deposition) pulses before an anodic spike are found from "
+        "the imposed current (cycle 1 = first of the ten, cycle 10 = the one right before the spike). "
+        "Each file usually holds 3 complete 10-pulse sequences; they can be averaged (mean ± SD) to "
+        "separate real trends from noise. The minimum is located on a zero-phase low-passed potential; "
+        "the raw minimum is biased low by the noise (≈ −2 to −3 mV). **Cycle 1 follows the previous "
+        "anodic pulse directly (no pause)**, so it is systematically less negative — hidden by default."
+    )
+    mc1, mc2, mc3 = st.columns([2.2, 1.4, 1.4])
+    with mc1:
+        mc_tp = st.text_input("⏱ Time points — minutes after the first usable file (comma-separated)",
+                              value="1, 10, 60, 300, 600", key="mc_tp",
+                              help="'Earliest' and 'Last' are added automatically, as in the Stacked tab.")
+    with mc2:
+        mc_value = st.selectbox("Value per cycle",
+                                ["Minimum (low-pass filtered)", "Minimum (raw)", "Φ at end of pulse"],
+                                key="mc_value")
+    with mc3:
+        mc_seq = st.selectbox("Pulse sequence", ["Mean of all complete sequences",
+                                                 "Sequence 1", "Sequence 2", "Sequence 3"], key="mc_seq",
+                              help="Sequence 1 = the one before spike #2 (same as the stacked plot for 7917).")
+    mc4, mc5, mc6 = st.columns([1, 1, 2])
+    with mc4:
+        mc_c1 = st.checkbox("Include cycle 1", value=False, key="mc_c1")
+    with mc5:
+        mc_err = st.checkbox("Error bars (± SD)", value=True, key="mc_err",
+                             disabled=not mc_seq.startswith("Mean"))
+    with mc6:
+        mc_cut = float(st.slider("Low-pass cut-off for locating the minimum (Hz)", 200, 2000, 500, step=50,
+                                 key="mc_cut"))
+    _mc_key = (st.session_state.get("_upload_key"), mc_tp, mc_cut)
+
+    if st.button("📊 Compute minimum vs cycle", type="primary", key="mc_btn"):
+        try:
+            _tps = [float(v.strip()) for v in mc_tp.split(",") if v.strip()]
+        except ValueError:
+            st.error("Enter comma-separated numbers (minutes).")
+            _tps = None
+        if _tps is not None:
+            _valid = [(f, ts) for f, ts in zip(file_names, timestamps) if ts is not None]
+            _res = {}
+            with st.spinner("Finding pulse sequences…"):
+                first = next(((f, ts) for f, ts in _valid if file_minima(f, _file_bytes[f], mc_cut)), None)
+                last = next(((f, ts) for f, ts in reversed(_valid) if file_minima(f, _file_bytes[f], mc_cut)), None)
+                picks = []
+                if first:
+                    picks.append(("Earliest", first[0]))
+                    for tp in _tps:
+                        tgt = first[1] + timedelta(minutes=tp)
+                        if last and tgt > last[1] + timedelta(minutes=1):
+                            continue
+                        k0 = min(range(len(_valid)), key=lambda k: abs((_valid[k][1] - tgt).total_seconds()))
+                        cands = [(abs((_valid[k][1] - tgt).total_seconds()), _valid[k][0])
+                                 for k in range(max(0, k0 - 10), min(len(_valid), k0 + 11))
+                                 if file_minima(_valid[k][0], _file_bytes[_valid[k][0]], mc_cut)]
+                        if cands:
+                            lbl = (f"{tp:.0f} min" if tp < 60 else f"{tp/60:.0f} h" if tp % 60 == 0
+                                   else f"{tp/60:.1f} h")
+                            picks.append((lbl, min(cands)[1]))
+                    if last:
+                        picks.append(("Last", last[0]))
+                seen = set()
+                for lbl, f in picks:
+                    if f in seen:
+                        continue
+                    seen.add(f)
+                    ts_ = _parse_ts(f)
+                    _res[lbl] = {"file": f, "seqs": file_minima(f, _file_bytes[f], mc_cut),
+                                 "elapsed_h": (ts_ - first[1]).total_seconds() / 3600 if ts_ else np.nan}
+            st.session_state["_mc"] = (_mc_key, _res)
+
+    _mc = st.session_state.get("_mc")
+    if _mc is None or _mc[0] != _mc_key:
+        st.info("Set the time points, then click **📊 Compute minimum vs cycle**. "
+                "Works on the 7 hand-picked files; tick *Include subfolders* for the full run.")
+    elif not _mc[1]:
+        st.error("No file with a complete 10-pulse sequence was found.")
+    else:
+        _key = {"Minimum (low-pass filtered)": "min_V", "Minimum (raw)": "min_raw_V",
+                "Φ at end of pulse": "end_V"}[mc_value]
+        use_mean = mc_seq.startswith("Mean")
+        stats, files_used, rows_tab = {}, {}, []
+        for lbl, r in _mc[1].items():
+            arr = np.array([[c[_key] for c in s] for s in r["seqs"]], dtype=float)
+            if use_mean:
+                m = arr.mean(0)
+                sd = arr.std(0, ddof=1) if len(arr) > 1 else np.full(arr.shape[1], np.nan)
+            else:
+                k = min(int(mc_seq.split()[-1]) - 1, len(arr) - 1)
+                m, sd = arr[k], np.full(arr.shape[1], np.nan)
+            stats[lbl] = (m, sd, len(arr))
+            files_used[lbl] = r["file"]
+            rows_tab.append({"Label": lbl, "File": r["file"], "Time (h)": round(r["elapsed_h"], 2),
+                             "Sequences in file": len(arr),
+                             "Mean cycles 2–10 (V)": round(float(np.mean(m[1:])), 5),
+                             "Spread between sequences, SD (mV)": (round(float(np.nanmean(arr[:, 1:].std(0, ddof=1))) * 1000, 2)
+                                                                   if len(arr) > 1 else np.nan)})
+        c0 = 0 if mc_c1 else 1
+        cyc = np.arange(1, 11)
+        shades = np.linspace(0.95, 0.35, len(stats))
+        cols = [to_hex(cm.Blues(v)) for v in shades]
+        figM = go.Figure()
+        for (lbl, (m, sd, n)), col in zip(stats.items(), cols):
+            figM.add_trace(go.Scatter(
+                x=cyc[c0:], y=m[c0:], mode="lines+markers", name=lbl,
+                line=dict(color=col, width=2), marker=dict(size=8, color=col, line=dict(color="white", width=1)),
+                error_y=(dict(type="data", array=sd[c0:], visible=True, thickness=1.2, width=4, color=col)
+                         if (use_mean and mc_err) else None),
+                hovertemplate=f"<b>{lbl}</b><br>cycle %{{x}}<br>%{{y:.4f}} V<extra></extra>"))
+        _vl = {"min_V": "Minimum Φ in V", "min_raw_V": "Minimum Φ (raw) in V", "end_V": "Φ at end of pulse in V"}[_key]
+        figM.update_layout(
+            height=520, margin=dict(l=70, r=30, t=70, b=50), plot_bgcolor="white", hovermode="closest",
+            title=dict(text=f"<b>{sample}</b> — {mc_value.lower()} per cycle · "
+                            f"{'mean ± SD of all complete sequences' if use_mean else mc_seq.lower()}",
+                       x=0, xanchor="left", font=dict(size=13)),
+            xaxis=dict(title="Cycle (1 = first of the ten, 10 = last before the anodic spike)",
+                       tickmode="linear", dtick=1, range=[c0 + 0.5, 10.5], showline=True, linecolor="black",
+                       gridcolor="rgba(150,150,150,0.3)"),
+            yaxis=dict(title=_vl, tickformat=".3f", showline=True, linecolor="black",
+                       gridcolor="rgba(150,150,150,0.3)"),
+            legend=dict(title="time point"))
+        st.plotly_chart(figM, width='stretch')
+        _span = np.ptp(np.concatenate([s[0][c0:] for s in stats.values()])) * 1000
+        st.caption(f"The y-axis spans about **{_span:.0f} mV**. For small-amplitude samples (e.g. 7917) the "
+                   "cycle-to-cycle zig-zag is at the noise level — compare it with the error bars.")
+
+        st.markdown("#### Files and noise")
+        st.dataframe(pd.DataFrame(rows_tab), width='stretch', hide_index=True)
+        tab_df = pd.DataFrame({"Cycle": cyc, **{l: s[0] for l, s in stats.items()}})
+        with st.expander("Values per cycle (V)"):
+            st.dataframe(tab_df.round(5), width='stretch', hide_index=True)
+
+        _mbase = f"{_fs}_minimum_vs_cycle" + ("" if use_mean else f"_seq{mc_seq.split()[-1]}")
+        m1, m2, m3, _ = st.columns([1, 1, 1, 3])
+        m1.download_button("⬇ CSV", tab_df.assign(**{f"{l} SD": s[1] for l, s in stats.items()})
+                           .to_csv(index=False).encode(), f"{_mbase}.csv", "text/csv", key="mc_csv")
+        m2.download_button("⬇ HTML", figM.to_html(include_plotlyjs="cdn").encode("utf-8"),
+                           f"{_mbase}.html", "text/html", key="mc_html")
+        m3.download_button(
+            "⬇ Excel",
+            minima_meansd_excel(stats, f"{sample} — {mc_value}", _vl.replace(" in V", " (V)"),
+                                note=(f"{mc_value}; {'mean ± SD over all complete 10-pulse sequences' if use_mean else mc_seq}. "
+                                      f"Low-pass {mc_cut:.0f} Hz used to locate the minimum. Cycle 1 follows the "
+                                      "previous anodic pulse directly. Exported from the Minimum vs Cycle tab."),
+                                files=files_used,
+                                spread_label="mean ± SD" if use_mean else mc_seq.lower()),
+            f"{_mbase}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="mc_xlsx")
+        st.caption("Excel: chart 1 = cycles 2–10 (with ± SD error bars when averaging), chart 2 = all cycles; "
+                   "a 'Sreya layout' sheet has the values in the old 'P minimum VS Cycle' format.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
