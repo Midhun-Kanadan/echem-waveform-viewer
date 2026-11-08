@@ -36,7 +36,7 @@ if getattr(echem_utils, "_loaded_mtime", None) != _eu_mtime:
 
 from echem_utils import (DENOISE_METHODS, FEATURE_INFO, average_windows, cycle_features,
                          cycle_minima, denoise, denoise_label, evolution_excel, is_flat,
-                         min_spike_amp, minima_meansd_excel, signal_excel, stacked_excel)
+                         min_spike_amp, minima_excel, minima_meansd_excel, signal_excel, stacked_excel)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -260,15 +260,15 @@ with st.sidebar:
     if data_source == "Local folder":
         folder_path = st.text_input(
             "Dataset folder path",
-            value=r"D:\Personal\Sreya\dataset-22-09-2026",
+            value=r"D:\Personal\Sreya\dataset-08-11-2026",
             help="Absolute path to the folder containing `*_filter.txt` files.",
         )
         if not folder_path:
             st.info("Enter the path to your dataset folder.")
             st.stop()
         include_sub = st.checkbox(
-            "Include subfolders", value=False,
-            help="Also load `*_filter.txt` from subfolders (e.g. `7917 DATA`, `7918 DATA`). "
+            "Include subfolders", value=True,
+            help="Also load `*_filter.txt` from subfolders (e.g. `7921 DATA`, `7922 DATA`). "
                  "Needed for multi-file averaging. Files with the same name are loaded once.",
         )
         _folder = Path(folder_path)
@@ -337,7 +337,7 @@ with st.sidebar:
     txt_path      = Path(selected_file)
     st.caption(f"📄 `{selected_file}`")
 
-    sample = st.text_input("Sample name", value="7917+7918",
+    sample = st.text_input("Sample name", value="7921+7922",
                            help="Used in plot titles and download file names.").strip() or "Sample"
     _fs = sample.replace(" ", "_")   # file-name-safe prefix
 
@@ -892,11 +892,26 @@ with tab_min:
         "the raw minimum is biased low by the noise (≈ −2 to −3 mV). **Cycle 1 follows the previous "
         "anodic pulse directly (no pause)**, so it is systematically less negative — hidden by default."
     )
+    mc_mode = st.radio("File selection", ["Automatic (time points)", "Manual (label = file name)"],
+                       horizontal=True, key="mc_mode",
+                       help="Manual: use exactly the files you list, e.g. hand-picked time points.")
+    mc_manual = ""
     mc1, mc2, mc3 = st.columns([2.2, 1.4, 1.4])
     with mc1:
-        mc_tp = st.text_input("⏱ Time points — minutes after the first usable file (comma-separated)",
-                              value="1, 10, 60, 300, 600", key="mc_tp",
-                              help="'Earliest' and 'Last' are added automatically, as in the Stacked tab.")
+        if mc_mode.startswith("Manual"):
+            mc_manual = st.text_area(
+                "One file per line: label = file name (the _filter.txt ending is optional)",
+                value=("Earliest = f20261006_141522_975\n1 min = f20261006_141618_243\n"
+                       "10 min = f20261006_142527_795\n1 h = f20261006_151522_596\n"
+                       "5 h = f20261006_191525_869\n10 h = f20261007_001525_002\n"
+                       "20 h = f20261007_101514_838"),
+                height=190, key="mc_manual",
+                help="Default = Sreya's 7921+7922 time points. A line without '=' uses the file's clock time as label.")
+            mc_tp = ""
+        else:
+            mc_tp = st.text_input("⏱ Time points — minutes after the first usable file (comma-separated)",
+                                  value="1, 10, 60, 300, 600", key="mc_tp",
+                                  help="'Earliest' and 'Last' are added automatically, as in the Stacked tab.")
     with mc2:
         mc_value = st.selectbox("Value per cycle",
                                 ["Minimum (low-pass filtered)", "Minimum (raw)", "Φ at end of pulse"],
@@ -905,8 +920,13 @@ with tab_min:
         mc_seq = st.selectbox("Pulse sequence", ["Mean of all complete sequences",
                                                  "Sequence 1", "Sequence 2", "Sequence 3"], key="mc_seq",
                               help="Sequence 1 = the one before spike #2 (same as the stacked plot for 7917).")
-    mc_orient = st.radio("Chart orientation", ["Cycle on x", "Potential on x (as in 'Sheet1')"],
-                         index=0, horizontal=True, key="mc_orient")
+    mo1, mo2 = st.columns([1.4, 1])
+    with mo1:
+        mc_orient = st.radio("Chart orientation", ["Potential on x, cycle on y", "Cycle on x"],
+                             index=0, horizontal=True, key="mc_orient")
+    with mo2:
+        mc_colors = st.radio("Colours", ["Distinct colours", "Blues (dark → light)"],
+                             index=0, horizontal=True, key="mc_colors")
     mc4, mc5, mc6 = st.columns([1, 1, 2])
     with mc4:
         mc_c1 = st.checkbox("Include cycle 1", value=False, key="mc_c1")
@@ -916,9 +936,35 @@ with tab_min:
     with mc6:
         mc_cut = float(st.slider("Low-pass cut-off for locating the minimum (Hz)", 200, 2000, 500, step=50,
                                  key="mc_cut"))
-    _mc_key = (st.session_state.get("_upload_key"), mc_tp, mc_cut)
+    _mc_key = (st.session_state.get("_upload_key"), mc_mode, mc_tp, mc_manual, mc_cut)
 
-    if st.button("📊 Compute minimum vs cycle", type="primary", key="mc_btn"):
+    _mc_go = st.button("📊 Compute minimum vs cycle", type="primary", key="mc_btn")
+    if _mc_go and mc_mode.startswith("Manual"):
+        _res, _bad = {}, []
+        with st.spinner("Finding pulse sequences…"):
+            for line in mc_manual.splitlines():
+                if not line.strip():
+                    continue
+                lbl, _, fn = line.partition("=") if "=" in line else ("", "", line)
+                fn = fn.strip().removesuffix(".txt").removesuffix("_filter")
+                hit = next((f for f in file_names if f.startswith(fn)), None) if fn else None
+                if hit is None:
+                    _bad.append(f"{line.strip()} → file not found in the loaded data")
+                    continue
+                seqs = file_minima(hit, _file_bytes[hit], mc_cut)
+                if not seqs:
+                    _bad.append(f"{line.strip()} → no complete 10-pulse sequence")
+                    continue
+                ts_ = _parse_ts(hit)
+                lbl = lbl.strip() or (ts_.strftime("%H:%M:%S") if ts_ else hit)
+                _res[lbl] = {"file": hit, "seqs": seqs, "ts": ts_}
+        _t0 = min((r["ts"] for r in _res.values() if r["ts"]), default=None)
+        for r in _res.values():
+            r["elapsed_h"] = (r["ts"] - _t0).total_seconds() / 3600 if (r["ts"] and _t0) else np.nan
+        for b in _bad:
+            st.warning(b)
+        st.session_state["_mc"] = (_mc_key, _res)
+    elif _mc_go:
         try:
             _tps = [float(v.strip()) for v in mc_tp.split(",") if v.strip()]
         except ValueError:
@@ -985,8 +1031,11 @@ with tab_min:
                                                                    if len(arr) > 1 else np.nan)})
         c0 = 0 if mc_c1 else 1
         cyc = np.arange(1, 11)
-        shades = np.linspace(0.95, 0.35, len(stats))
-        cols = [to_hex(cm.Blues(v)) for v in shades]
+        if mc_colors.startswith("Distinct"):
+            _pal = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
+            cols = [_pal[k % len(_pal)] for k in range(len(stats))]
+        else:
+            cols = [to_hex(cm.Blues(v)) for v in np.linspace(0.95, 0.35, len(stats))]
         pot_x = mc_orient.startswith("Potential")
         figM = go.Figure()
         for (lbl, (m, sd, n)), col in zip(stats.items(), cols):
@@ -1024,7 +1073,56 @@ with tab_min:
             st.dataframe(tab_df.round(5), width='stretch', hide_index=True)
 
         _mbase = f"{_fs}_minimum_vs_cycle" + ("" if use_mean else f"_seq{mc_seq.split()[-1]}")
-        m1, m2, m3, _ = st.columns([1, 1, 1, 3])
+        def _mc_png() -> bytes:
+            figp, axp = plt.subplots(figsize=(11, 5.6), dpi=150)
+            for (lbl, (m, sd, n)), col in zip(stats.items(), cols):
+                e = sd[c0:] if (use_mean and mc_err and np.isfinite(sd).any()) else None
+                xs, ys = (m[c0:], cyc[c0:]) if pot_x else (cyc[c0:], m[c0:])
+                axp.errorbar(xs, ys, xerr=e if pot_x else None, yerr=None if pot_x else e, fmt="-o",
+                             color=col, lw=2, ms=6, mec="white", mew=1, capsize=3, elinewidth=1, label=lbl)
+            (axp.set_yticks if pot_x else axp.set_xticks)(range(c0 + 1, 11))
+            (axp.set_ylim if pot_x else axp.set_xlim)(c0 + 0.5, 10.5)
+            axp.set_xlabel(_vl if pot_x else "Cycle")
+            axp.set_ylabel("Cycle" if pot_x else _vl)
+            axp.grid(True, color="#e0e0e0", lw=0.8)
+            axp.set_axisbelow(True)
+            for sp_ in ("top", "right"):
+                axp.spines[sp_].set_visible(False)
+            axp.set_title(f"{sample}: {mc_value.lower()} per cycle", fontsize=13, pad=10)
+            figp.text(0.01, 0.01,
+                      f"{'Mean ± SD of all complete 10-pulse sequences per file' if use_mean else mc_seq}; "
+                      f"{mc_cut:.0f} Hz zero-phase low-pass used to locate the minimum. "
+                      "Cycle 1 follows the anodic pulse directly (no pause).", fontsize=8, color="#555")
+            axp.legend(ncol=min(len(stats), 8), loc="upper center", bbox_to_anchor=(0.5, -0.12),
+                       frameon=False, fontsize=9)
+            figp.tight_layout(rect=(0, 0.03, 1, 1))
+            buf = io.BytesIO()
+            figp.savefig(buf, format="png")
+            plt.close(figp)
+            return buf.getvalue()
+
+        # Same table + Details layout as extract_cycle_minima.py (<sample>_cycle_minima[_seq-mean].csv/.xlsx)
+        _seq_tag = "mean" if use_mean else mc_seq.split()[-1]
+        _det = []
+        for lbl, r in _mc[1].items():
+            sq = r["seqs"]
+            mean_rows = [{k: float(np.mean([q[c][k] for q in sq])) for k in ("min_V", "min_raw_V", "end_V", "tau_ms")}
+                         for c in range(len(sq[0]))]
+            sel = mean_rows if use_mean else sq[min(int(_seq_tag) - 1, len(sq) - 1)]
+            for c, (rf, rm) in enumerate(zip(sel, mean_rows), start=1):
+                _det.append({"label": lbl, "file": r["file"], "cycle": c, "sequence": _seq_tag,
+                             "tau_ms": round(rf["tau_ms"], 1), "min_V": rf["min_V"], "min_raw_V": rf["min_raw_V"],
+                             "end_V": rf["end_V"], "min_V_mean_of_sequences": rm["min_V"],
+                             "end_V_mean_of_sequences": rm["end_V"], "n_sequences": len(sq)})
+        _det = pd.DataFrame(_det)
+        _cm_base = f"{_fs}_cycle_minima" + ("" if _seq_tag == "1" else f"_seq-{_seq_tag}")
+        _cm_note = (f"{sample}: value per cycle = {mc_value}. Pulses found from the imposed current; cycle 1 = first "
+                    f"of the 10 cathodic pulses before the anodic spike, cycle 10 = the last one. Filter: zero-phase "
+                    f"low-pass {mc_cut:.0f} Hz (only to locate the minimum; raw minimum in 'Details'). Sequence per "
+                    f"file: {_seq_tag} ('mean' = average of all complete sequences). Cycle 1 follows the previous "
+                    f"anodic pulse directly (no pause), so it is less negative. Exported from the Minimum vs Cycle tab.")
+
+        m1, m2, m3, m4, _ = st.columns([1, 1, 1, 1, 2])
         m1.download_button("⬇ CSV", tab_df.assign(**{f"{l} SD": s[1] for l, s in stats.items()})
                            .to_csv(index=False).encode(), f"{_mbase}.csv", "text/csv", key="mc_csv")
         m2.download_button("⬇ HTML", figM.to_html(include_plotlyjs="cdn").encode("utf-8"),
@@ -1038,6 +1136,17 @@ with tab_min:
                                 files=files_used,
                                 spread_label="mean ± SD" if use_mean else mc_seq.lower()),
             f"{_mbase}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="mc_xlsx")
+        m4.download_button("⬇ PNG", _mc_png(), f"{_cm_base}_potential_vs_cycle.png", "image/png", key="mc_png")
+        st.markdown("**Cycle-minima table** (same files as `extract_cycle_minima.py`: "
+                    "`Minimum vs cycle` sheet + `Details` sheet)")
+        n1, n2, _ = st.columns([1.3, 1.3, 3.4])
+        n1.download_button("⬇ Cycle minima CSV", _det.to_csv(index=False).encode(), f"{_cm_base}.csv",
+                           "text/csv", key="mc_det_csv")
+        n2.download_button(
+            "⬇ Cycle minima Excel",
+            minima_excel(tab_df, _det, f"{sample} — {mc_value} vs cycle", _vl.replace(" in V", " (V)"), _cm_note),
+            f"{_cm_base}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="mc_det_xlsx")
         st.caption("Excel: 'Chart' = cycle on x (cycles 2–10 with ± SD, and all cycles); 'Sheet1' = the original "
                    "paired Potential | Cycle layout with two charts in its orientation (potential on x, straight "
                    "lines, ± SD error bars); 'Sheet1 (2)' = Cycle | one column per time point; 'Mean and SD' = values.")
