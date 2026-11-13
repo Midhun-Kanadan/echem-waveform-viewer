@@ -178,6 +178,39 @@ def cycle_features(ch1, ch2, fs: int = FS):
     }
 
 
+def spike_peak_values(t_ms, phi, cur, pre_ms=(1.5, 0.5)):
+    """Values of the last (anodic) peak of one stacked-plot window (τ = 0 at the spike top).
+
+    onset      = first sample of the anodic current pulse before the spike (current > 50 % of its anodic level)
+    beginning  = mean potential from pre_ms[0] to pre_ms[1] ms before the onset (the last ~0.5 ms before the
+                 onset rings by ±20 mV in the recorder's filter stage, so single samples there are not used)
+    peak       = maximum potential of the spike
+    difference = peak − beginning
+    Returns a dict, or None if no anodic pulse is found in the window.
+    """
+    t = np.asarray(t_ms, dtype=float); x = np.asarray(phi, dtype=float); i = np.asarray(cur, dtype=float)
+    near = t > -20
+    if not near.any():
+        return None
+    k_pk = int(np.argmax(np.where(near, x, -np.inf)))
+    zone = (t > t[k_pk] - 20) & (t <= t[k_pk])
+    pos = zone & (i > 0)
+    if not pos.any():
+        return None
+    lvl = float(np.median(i[pos & (t > t[k_pk] - 6)])) if (pos & (t > t[k_pk] - 6)).any() else float(np.max(i[pos]))
+    on = np.where(zone & (i > 0.5 * lvl))[0]
+    if not len(on):
+        return None
+    k_on = int(on[0])
+    pre = (t >= t[k_on] - pre_ms[0]) & (t < t[k_on] - pre_ms[1])
+    if not pre.any():
+        return None
+    begin = float(x[pre].mean())
+    return {"beginning_V": begin, "t_beginning_ms": float(t[k_on]), "peak_V": float(x[k_pk]),
+            "t_peak_ms": float(t[k_pk]), "difference_V": float(x[k_pk]) - begin,
+            "rise_ms": float(t[k_pk] - t[k_on]), "k_onset": k_on, "k_peak": k_pk}
+
+
 def cycle_minima(ch1, ch2, n_cycles: int = 10, cutoff_hz: float = 500.0, fs: int = FS):
     """Minimum potential of each cathodic pulse in the `n_cycles` pulses before an anodic pulse.
 

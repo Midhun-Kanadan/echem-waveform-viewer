@@ -36,7 +36,8 @@ if getattr(echem_utils, "_loaded_mtime", None) != _eu_mtime:
 
 from echem_utils import (DENOISE_METHODS, FEATURE_INFO, average_windows, cycle_features,
                          cycle_minima, denoise, denoise_label, evolution_excel, is_flat,
-                         min_spike_amp, minima_excel, minima_meansd_excel, signal_excel, stacked_excel)
+                         min_spike_amp, minima_excel, minima_meansd_excel, signal_excel, spike_peak_values,
+                         stacked_excel)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -57,6 +58,150 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+# ── Last-peak panel: table + charts with hover highlighting (Custom Component v2) ──
+_PEAK_CSS = """
+.pk { font-family: var(--st-font, sans-serif); color: var(--st-text-color); font-size: 0.85rem; }
+.pk-charts { display: flex; gap: 12px; flex-wrap: wrap; }
+.pk-chart { flex: 1 1 360px; min-width: 300px; }
+.pk-chart.wide { flex: 2 1 520px; }
+.pk-title { font-weight: 600; margin: 2px 0 4px 4px; }
+.pk svg { width: 100%; height: auto; display: block; overflow: visible; }
+.pk .axis line, .pk .axis path { stroke: var(--st-text-color); stroke-opacity: 0.55; }
+.pk .grid line { stroke: var(--st-border-color, #ccc); stroke-opacity: 0.6; }
+.pk .axis text, .pk .lab { fill: var(--st-text-color); font-size: 11px; }
+.pk .curve { fill: none; stroke-width: 1.2; transition: opacity 120ms, stroke-width 120ms; }
+.pk .hit { fill: none; stroke: transparent; stroke-width: 9; cursor: pointer; }
+.pk .mk { stroke: var(--st-text-color); stroke-width: 1; transition: opacity 120ms; cursor: pointer; }
+.pk .dim { opacity: 0.12; }
+.pk .on .curve { stroke-width: 2.6; }
+.pk .bracket { display: none; }
+.pk .on .bracket { display: inline; }
+.pk .bracket line { stroke: var(--st-text-color); stroke-width: 1.2; }
+.pk .bracket .lvl { stroke-dasharray: 3 3; }
+.pk .bracket text { fill: var(--st-text-color); font-size: 12px; font-weight: 600; }
+.pk table { border-collapse: collapse; width: 100%; margin-top: 10px; }
+.pk th, .pk td { padding: 5px 8px; border-bottom: 1px solid var(--st-border-color, #ddd); text-align: right; }
+.pk th { font-weight: 600; background: var(--st-secondary-background-color); }
+.pk th:first-child, .pk td:first-child { text-align: left; white-space: nowrap; }
+.pk tbody tr { cursor: pointer; }
+.pk tbody tr.on { background: var(--st-secondary-background-color); outline: 2px solid var(--st-primary-color); }
+.pk .sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; margin-right: 6px;
+          vertical-align: -1px; border: 1px solid var(--st-text-color); }
+.pk .hint { opacity: 0.7; margin-top: 4px; }
+"""
+
+_PEAK_JS = r"""
+const NS = "http://www.w3.org/2000/svg";
+function sv(tag, attrs, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function ticks(lo, hi, n) {
+  const raw = (hi - lo) / n, mag = Math.pow(10, Math.floor(Math.log10(raw))), r = raw / mag;
+  const step = (r >= 7.5 ? 10 : r >= 3.5 ? 5 : r >= 1.5 ? 2 : 1) * mag, out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-6; v += step) out.push(+v.toFixed(10));
+  return out;
+}
+function chart(host, cfg, curves, register) {
+  const W = cfg.w, H = cfg.h, m = { l: 58, r: 14, t: 8, b: 38 };
+  const svg = sv("svg", { viewBox: `0 0 ${W} ${H}`, style: `max-width:${W * 1.25}px` }, host);
+  const [x0, x1] = cfg.xr, [y0, y1] = cfg.yr;
+  const X = v => m.l + (v - x0) / (x1 - x0) * (W - m.l - m.r);
+  const Y = v => H - m.b - (v - y0) / (y1 - y0) * (H - m.t - m.b);
+  const grid = sv("g", { class: "grid" }, svg), axis = sv("g", { class: "axis" }, svg);
+  for (const v of ticks(x0, x1, cfg.nx || 8)) {
+    sv("line", { x1: X(v), x2: X(v), y1: m.t, y2: H - m.b }, grid);
+    sv("text", { x: X(v), y: H - m.b + 14, "text-anchor": "middle" }, axis).textContent = v;
+  }
+  for (const v of ticks(y0, y1, 6)) {
+    sv("line", { x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v) }, grid);
+    sv("text", { x: m.l - 6, y: Y(v) + 4, "text-anchor": "end" }, axis).textContent = v.toFixed(2);
+  }
+  sv("path", { d: `M${m.l},${m.t}V${H - m.b}H${W - m.r}`, fill: "none" }, axis);
+  sv("text", { x: (m.l + W - m.r) / 2, y: H - 4, "text-anchor": "middle", class: "lab" }, svg).textContent = cfg.xlabel;
+  const yl = sv("text", { x: 12, y: (m.t + H - m.b) / 2, "text-anchor": "middle", class: "lab",
+                          transform: `rotate(-90 12 ${(m.t + H - m.b) / 2})` }, svg);
+  yl.textContent = "Φ in V";
+  const clip = "clip" + Math.random().toString(36).slice(2);
+  sv("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b },
+     sv("clipPath", { id: clip }, sv("defs", {}, svg)));
+  const body = sv("g", { "clip-path": `url(#${clip})` }, svg);
+  const marks = sv("g", {}, svg);
+  curves.forEach((c, i) => {
+    const g = sv("g", { "data-i": i }, body);
+    const pts = c[cfg.tk].map((t, j) => `${X(t).toFixed(1)},${Y(c[cfg.yk][j]).toFixed(1)}`).join(" ");
+    sv("polyline", { points: pts, class: "curve", stroke: c.color }, g);
+    sv("polyline", { points: pts, class: "hit" }, g);
+    const mg = sv("g", { "data-i": i }, marks);
+    if (cfg.bracket) {
+      const b = sv("g", { class: "bracket" }, mg), xb = X(c.t_pk) + 10;
+      sv("line", { class: "lvl", x1: X(c.t_on), x2: xb, y1: Y(c.begin), y2: Y(c.begin) }, b);
+      sv("line", { class: "lvl", x1: X(c.t_pk), x2: xb, y1: Y(c.peak), y2: Y(c.peak) }, b);
+      sv("line", { x1: xb, x2: xb, y1: Y(c.begin), y2: Y(c.peak) }, b);
+      sv("text", { x: xb + 5, y: (Y(c.begin) + Y(c.peak)) / 2 + 4 }, b).textContent =
+        `Δ = ${c.diff_mV.toFixed(1)} mV`;
+    }
+    const s = 5;
+    sv("rect", { x: X(c.t_on) - s, y: Y(c.begin) - s, width: 2 * s, height: 2 * s, fill: c.color, class: "mk" }, mg);
+    sv("circle", { cx: X(c.t_pk), cy: Y(c.peak), r: s + 0.5, fill: c.color, class: "mk" }, mg);
+    register(i, g, mg);
+  });
+}
+export default function (component) {
+  const { data, parentElement } = component;
+  const root = parentElement.querySelector("#pk-root");
+  if (!root || !data || !data.curves) return;
+  root.innerHTML = "";
+  const curves = data.curves, groups = curves.map(() => []), rows = [];
+  const reg = (i, ...els) => groups[i].push(...els);
+  const highlight = (i) => {
+    groups.forEach((els, k) => els.forEach(e => {
+      e.classList.toggle("dim", i !== null && k !== i);
+      e.classList.toggle("on", k === i);
+    }));
+    rows.forEach((r, k) => r.classList.toggle("on", k === i));
+  };
+  const box = document.createElement("div"); box.className = "pk"; root.appendChild(box);
+  const charts = document.createElement("div"); charts.className = "pk-charts"; box.appendChild(charts);
+  const mk = (cls, title) => {
+    const d = document.createElement("div"); d.className = "pk-chart " + cls; charts.appendChild(d);
+    const h = document.createElement("div"); h.className = "pk-title"; h.textContent = title; d.appendChild(h);
+    return d;
+  };
+  chart(mk("wide", data.title_overview), { w: 640, h: 300, tk: "t", yk: "y", xr: data.xr, yr: data.yr,
+        xlabel: data.xlabel, nx: 10 }, curves, reg);
+  chart(mk("", data.title_zoom), { w: 380, h: 300, tk: "tz", yk: "yz", xr: data.xr_zoom, yr: data.yr_zoom || data.yr,
+        xlabel: data.xlabel, nx: 6, bracket: true }, curves, reg);
+  const tbl = document.createElement("table"); box.appendChild(tbl);
+  tbl.innerHTML = "<thead><tr><th>Curve</th><th>Beginning (V)</th><th>Peak (V)</th>" +
+    "<th>Difference (V)</th><th>Difference (mV)</th><th>τ beginning (ms)</th><th>τ peak (ms)</th>" +
+    "<th>Rise time (ms)</th></tr></thead>";
+  const tb = document.createElement("tbody"); tbl.appendChild(tb);
+  curves.forEach((c, i) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td><span class="sw" style="background:${c.color}"></span>${c.label}</td>` +
+      `<td>${c.begin.toFixed(4)}</td><td>${c.peak.toFixed(4)}</td><td>${(c.diff_mV / 1000).toFixed(4)}</td>` +
+      `<td>${c.diff_mV.toFixed(1)}</td><td>${c.t_on.toFixed(1)}</td><td>${c.t_pk.toFixed(1)}</td>` +
+      `<td>${c.rise.toFixed(1)}</td>`;
+    tb.appendChild(tr); rows.push(tr);
+    tr.addEventListener("mouseenter", () => highlight(i));
+    tr.addEventListener("mouseleave", () => highlight(null));
+    groups[i].forEach(e => {
+      e.addEventListener("mouseenter", () => highlight(i));
+      e.addEventListener("mouseleave", () => highlight(null));
+    });
+  });
+  const hint = document.createElement("div"); hint.className = "hint"; box.appendChild(hint);
+  hint.textContent = data.hint;
+}
+"""
+
+_PEAK_PANEL = (st.components.v2.component(
+    "last_peak_panel", html='<div id="pk-root"></div>', css=_PEAK_CSS, js=_PEAK_JS)
+    if hasattr(st, "components") and hasattr(st.components, "v2") else None)
 
 st.title("⚡ Electrochemical Signal Viewer")
 st.caption("Yokogawa DL850E · Filtered TXT files · Dual-axis interactive plot")
@@ -1504,6 +1649,47 @@ with tab_stacked:
                 showgrid=False, zeroline=False, showline=True, linecolor=lc_s,
             )
 
+        # ── Last (anodic) peak: beginning, top, difference (raw signal) ─────
+        _pk_rows, _pk_curves = [], []
+        if stack_ch in ("Potential (Φ)", "Both"):
+            for i, e in enumerate(entries):
+                _off = _offsets[e["label"]]
+                _phi_r = np.asarray(e.get("ch1_raw", e["ch1"]))
+                _cur_r = np.asarray(e.get("ch2_raw", e["ch2"]))
+                _v = spike_peak_values(np.asarray(e["t_ms"]), _phi_r, _cur_r)   # values independent of alignment
+                if _v is None:
+                    continue
+                _t_full = np.asarray(e["t_ms"]) + _off                            # τ as plotted
+                for _k in ("t_beginning_ms", "t_peak_ms"):
+                    _v[_k] += _off
+                _pk_rows.append({"Curve": e["label"], "File": e["file"],
+                                 "Beginning (V)": round(_v["beginning_V"], 4), "Peak (V)": round(_v["peak_V"], 4),
+                                 "Difference (V)": round(_v["difference_V"], 4),
+                                 "Difference (mV)": round(_v["difference_V"] * 1000, 1),
+                                 "τ beginning (ms)": round(_v["t_beginning_ms"], 1),
+                                 "τ peak (ms)": round(_v["t_peak_ms"], 1), "Rise time (ms)": round(_v["rise_ms"], 1)})
+                # plotted curve (left edge trimmed as in the stacked plot), thinned for the overview chart
+                _t_on_lvl = float(np.median(e["ch1"]))
+                _valid = np.where(e["ch1"] <= _t_on_lvl)[0]
+                _s0 = int(_valid[0]) if len(_valid) else 0
+                _step = max(1, (len(_t_full) - _s0) // 1500)
+                _zm = (_t_full >= _v["t_peak_ms"] - 9) & (_t_full <= _v["t_peak_ms"] + 3)
+                _pk_curves.append({
+                    "label": e["label"], "color": phi_cols[i],
+                    "t": np.round(_t_full[_s0::_step], 2).tolist(), "y": np.round(_phi_r[_s0::_step], 4).tolist(),
+                    "tz": np.round(_t_full[_zm], 2).tolist(), "yz": np.round(_phi_r[_zm], 4).tolist(),
+                    "t_on": _v["t_beginning_ms"], "begin": _v["beginning_V"], "t_pk": _v["t_peak_ms"],
+                    "peak": _v["peak_V"], "diff_mV": _v["difference_V"] * 1000, "rise": _v["rise_ms"]})
+                _yax = "y"
+                fig_s.add_trace(go.Scatter(
+                    x=[_v["t_beginning_ms"], _v["t_peak_ms"]], y=[_v["beginning_V"], _v["peak_V"]],
+                    mode="markers", yaxis=_yax, legendgroup=e["label"], showlegend=False,
+                    marker=dict(symbol=["square", "circle"], size=9, color=phi_cols[i],
+                                line=dict(color=ax_s, width=1)),
+                    customdata=[["beginning"], ["peak"]],
+                    hovertemplate=(f"<b>{e['label']}</b> — %{{customdata[0]}}<br>τ=%{{x:.1f}} ms<br>"
+                                   f"Φ=%{{y:.4f}} V<br>Δ = {_v['difference_V'] * 1000:.1f} mV<extra></extra>")))
+
         fig_s.update_layout(**layout_kw)
         st.plotly_chart(fig_s, width='stretch')
 
@@ -1540,6 +1726,47 @@ with tab_stacked:
             for i, e in enumerate(entries)
         )
         st.markdown(chips, unsafe_allow_html=True)
+
+        if _pk_rows:
+            st.markdown("---")
+            st.markdown("#### 🔺 Last peak: beginning, top and difference")
+            st.caption("For each curve: **beginning** = mean potential from 1.5 to 0.5 ms before the anodic "
+                       "current switches on (the last 0.5 ms rings in the recorder's filter); **peak** = highest "
+                       "potential of the last (anodic) spike; **difference** = peak − beginning. Computed on the "
+                       "raw signal, also when Denoise is on. In the main plot the points are marked with ■ "
+                       "(beginning) and ● (peak).")
+            _pk_df = pd.DataFrame(_pk_rows)
+            if _PEAK_PANEL is not None:
+                _all_y = np.concatenate([c["y"] for c in _pk_curves])
+                _yspan = float(_all_y.max() - _all_y.min()) or 1.0
+                _tpk = float(np.median([c["t_pk"] for c in _pk_curves]))
+                _zspan = (max(c["peak"] for c in _pk_curves) - min(c["begin"] for c in _pk_curves)) or 1.0
+                _PEAK_PANEL(
+                    data={"curves": _pk_curves,
+                          "xr": [float(min(c["t"][0] for c in _pk_curves)), float(max(c["t"][-1] for c in _pk_curves))],
+                          "xr_zoom": [_tpk - 8.0, _tpk + 2.5],
+                          "yr": [float(_all_y.min()) - 0.05 * _yspan, float(_all_y.max()) + 0.08 * _yspan],
+                          "yr_zoom": [min(c["begin"] for c in _pk_curves) - 0.08 * _zspan,
+                                      max(c["peak"] for c in _pk_curves) + 0.06 * _zspan],
+                          "xlabel": "τ in ms", "title_overview": "Stacked curves (raw)",
+                          "title_zoom": "Zoom on the last peak: ■ beginning, ● peak",
+                          "hint": "Hover over a row of the table, or over a curve, to highlight it."},
+                    key="last_peak_panel", width="stretch")
+            else:
+                st.dataframe(_pk_df.drop(columns=["File"]), width='stretch', hide_index=True)
+            _pk_base = f"{_fs}_last_peak_values"
+            _pk_xl = io.BytesIO()
+            with pd.ExcelWriter(_pk_xl, engine="openpyxl") as _xw:
+                _pk_df.to_excel(_xw, sheet_name="Last peak", index=False)
+                pd.DataFrame({"Note": [
+                    "Beginning = mean potential 1.5–0.5 ms before the anodic current switches on; peak = maximum "
+                    "potential of the last (anodic) spike; difference = peak − beginning. Raw signal. "
+                    f"Alignment: {align_mode}."]}).to_excel(_xw, sheet_name="Notes", index=False)
+            pk1, pk2, _ = st.columns([1, 1, 4])
+            pk1.download_button("⬇ CSV", _pk_df.to_csv(index=False).encode(), f"{_pk_base}.csv", "text/csv",
+                                key="pk_csv")
+            pk2.download_button("⬇ Excel", _pk_xl.getvalue(), f"{_pk_base}.xlsx",
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="pk_xlsx")
 
         st.markdown("---")
 
